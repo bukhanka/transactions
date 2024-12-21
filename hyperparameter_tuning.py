@@ -120,6 +120,33 @@ class HyperparameterTuner:
             fig.show()
         except Exception as e:
             print(f"Error plotting results: {str(e)}")
+    
+    def log_tuning_results(self, trial):
+        """Log detailed results of each trial"""
+        results_path = Path('results/tuning')
+        results_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create detailed results log
+        trial_results = {
+            'trial_number': trial.number,
+            'params': trial.params,
+            'metrics': {
+                'profit': trial.value,
+                'conversion_rate': self.last_results.get('conversion_rate', 0),
+                'avg_chain_length': self.last_results.get('avg_chain_length', 0),
+                'avg_processing_time': self.last_results.get('avg_time', 0),
+                'total_penalties': self.last_results.get('penalties', 0)
+            }
+        }
+        
+        # Save to CSV for easy analysis
+        results_df = pd.DataFrame([trial_results])
+        csv_path = results_path / 'tuning_history.csv'
+        
+        if csv_path.exists():
+            results_df.to_csv(csv_path, mode='a', header=False, index=False)
+        else:
+            results_df.to_csv(csv_path, index=False)
 
 def main():
     # Initialize tuner

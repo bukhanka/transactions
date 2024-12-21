@@ -75,8 +75,42 @@ def evaluate_solution(results_df, providers_df):
     elapsed = time.time() - start_time
     print(f"\nEvaluation time: {elapsed:.2f} seconds")
 
+def reset_daily_states():
+    """Reset all provider states and counters for a new day"""
+    print("\nResetting daily states...")
+    
+    # Reset provider tracking from olution.py
+    from olution import recent_success_tracker, reset_daily_states as reset_solution_states
+    
+    # Reset the solution states
+    reset_solution_states()
+    
+    print("Daily states reset complete")
+
+def process_day(day_number, payments_file, providers, cache_path, force_reprocess=False):
+    """Process a single day's transactions"""
+    print(f"\nProcessing Day {day_number} transactions...")
+    
+    # Try to load cached results first
+    results = None if force_reprocess else load_results(cache_path)
+    
+    if results is None:
+        # Reset states before processing
+        reset_daily_states()
+        
+        # Process transactions
+        results = simulate_transactions_parallel(providers, str(payments_file), use_gpu=True)
+        
+        # Format results keeping evaluation columns
+        results = format_final_output(results, for_output=False)
+        
+        # Cache results
+        save_results(results, cache_path)
+    
+    return results
+
 def main(force_reprocess=False, hyperparams=None):
-    """Modified main function with separate day handling"""
+    """Modified main function with clear day separation"""
     if hyperparams is None:
         hyperparams = {
             'penalty_weight': 1.3,
@@ -117,26 +151,9 @@ def main(force_reprocess=False, hyperparams=None):
     init_time = time.time() - init_start
     print(f"Provider initialization time: {init_time:.2f} seconds")
     
-    # Process payment set 1 (Day 1)
-    print("\nProcessing Day 1 transactions...")
-    results_1 = None if force_reprocess else load_results(cache_paths['results_1'])
-    if results_1 is None:
-        # Reset all daily counters and states
-        reset_daily_states()
-        results_1 = simulate_transactions_parallel(providers, str(paths['payments_1']), use_gpu=True)
-        results_1 = format_final_output(results_1)
-        save_results(results_1, cache_paths['results_1'])
-    
-    # Reset all states before Day 2
-    reset_daily_states()
-    
-    # Process payment set 2 (Day 2)
-    print("\nProcessing Day 2 transactions...")
-    results_2 = None if force_reprocess else load_results(cache_paths['results_2'])
-    if results_2 is None:
-        results_2 = simulate_transactions_parallel(providers, str(paths['payments_2']), use_gpu=True)
-        results_2 = format_final_output(results_2)
-        save_results(results_2, cache_paths['results_2'])
+    # Process each day separately
+    results_1 = process_day(1, paths['payments_1'], providers, cache_paths['results_1'], force_reprocess)
+    results_2 = process_day(2, paths['payments_2'], providers, cache_paths['results_2'], force_reprocess)
     
     # Calculate metrics for both days
     metrics_day1 = calculate_metrics(results_1, providers)
@@ -148,6 +165,14 @@ def main(force_reprocess=False, hyperparams=None):
     
     print("\n=== Results for Payment Set 2 ===")
     evaluate_solution(results_2, providers)
+    
+    # Save final output format
+    final_results_1 = format_final_output(results_1, for_output=True)
+    final_results_2 = format_final_output(results_2, for_output=True)
+    
+    # Save final results in required format
+    save_results(final_results_1, results_dir / 'final_payment_set_1.csv')
+    save_results(final_results_2, results_dir / 'final_payment_set_2.csv')
     
     # Combine metrics from both days
     total_metrics = {
@@ -217,6 +242,10 @@ def simulate_transactions_parallel(providers, transactions_file, num_processes=N
             return create_empty_results()
             
         final_results = pd.concat(results, ignore_index=True)
+        
+        # Format results before returning
+        final_results = format_final_output(final_results)
+        
         print(f"\nSuccessfully processed {len(final_results):,} transactions")
         return final_results
         
@@ -244,16 +273,45 @@ def parse_args():
     return parser.parse_args()
 
 def save_results(results, filepath):
-    """Save processed results to a file with CSV fallback"""
+    """Save processed results to a file"""
     try:
-        # Try parquet first
-        results.to_parquet(filepath, compression='gzip')
+        if filepath.suffix == '.csv':
+            results.to_csv(filepath, index=False)
+        else:
+            results.to_parquet(filepath, compression='gzip')
         print(f"Results saved to {filepath}")
     except Exception as e:
-        # Fallback to CSV if parquet fails
-        csv_path = str(filepath).replace('.parquet', '.csv')
-        results.to_csv(csv_path, index=False)
-        print(f"Results saved to {csv_path} (CSV fallback)")
+        print(f"Error saving results: {str(e)}")
+
+def format_final_output(results_df, for_output=False):
+    """Format results to match required output format
+    
+    Args:
+        results_df: DataFrame with results
+        for_output: If True, only keep columns required for final output
+    """
+    # Create a copy to avoid modifying the original
+    df = results_df.copy()
+    
+    # Clean up flow column (empty string for failures) before removing status column
+    df['flow'] = df.apply(
+        lambda row: row['flow'] if row.get('status') == 'CAPTURED' else '',
+        axis=1
+    )
+    
+    if for_output:
+        # For final output, keep only required columns
+        payment_columns = ['payment', 'amount', 'cur', 'eventTimeRes', 'flow']
+        final_df = df[payment_columns]
+    else:
+        # For evaluation, keep additional columns
+        required_cols = [
+            'payment', 'amount', 'cur', 'eventTimeRes', 
+            'flow', 'status', 'provider', 'amount_usd'
+        ]
+        final_df = df[required_cols]
+    
+    return final_df
 
 if __name__ == "__main__":
     args = parse_args()

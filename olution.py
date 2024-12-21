@@ -21,7 +21,8 @@ import time
 from tqdm import tqdm  # Add at top with other imports
 from functools import partial
 from collections import deque
-from random import random
+import random  # Add this line with other imports
+from types import SimpleNamespace  # Add to imports at top
 
 # At the top of the file after imports
 ex_rates = None
@@ -322,7 +323,9 @@ def process_chunk_wrapper(args):
         return pd.DataFrame()
 
 def process_transaction_chunk(chunk, providers, use_gpu=True):
-    """Process chunk with improved fallback chain logic"""
+    """Process chunk with conversion tracking"""
+    tracker = ConversionTracker()
+    
     try:
         # Create a copy of providers to avoid sharing memory between processes
         providers = providers.copy()
@@ -344,121 +347,91 @@ def process_transaction_chunk(chunk, providers, use_gpu=True):
         if provider_data.empty:
             return pd.DataFrame([{
                 'payment': row['payment'],
-                'flow': 'failed',
+                'flow': '',
                 'status': 'FAILED',
                 'provider': None,
                 'eventTimeRes': row['eventTimeRes'],
                 'amount_usd': row['amount_usd'],
-                'amount': row['amount'],  # Preserve original amount
-                'cur': row['cur']  # Preserve original currency
+                'amount': row['amount'],
+                'cur': row['cur']
             } for _, row in chunk.iterrows()])
+        
+        # Convert provider_data to ProviderState objects
+        provider_states = [ProviderState(row) for _, row in provider_data.iterrows()]
+        
+        # Track statistics for logging
+        total_processed = 0
+        total_failed = 0
+        amount_mismatches = 0
         
         # Process transactions
         for _, txn in chunk.iterrows():
+            total_processed += 1
             try:
-                # Filter valid providers
-                valid_providers = provider_data[
-                    (txn['amount'] >= provider_data['MIN_SUM']) & 
-                    (txn['amount'] <= provider_data['MAX_SUM']) & 
-                    (txn['cur'] == provider_data['CURRENCY'])
-                ].copy()
+                # Create a transaction object
+                transaction = SimpleNamespace(
+                    amount=txn['amount'],
+                    cur=txn['cur'],
+                    amount_usd=txn['amount_usd']
+                )
                 
-                if valid_providers.empty:
-                    results.append({
-                        'payment': txn['payment'],
-                        'flow': 'failed',
-                        'status': 'FAILED',
-                        'provider': None,
-                        'eventTimeRes': txn['eventTimeRes'],
-                        'amount_usd': txn['amount_usd'],
-                        'amount': txn['amount'],  # Preserve original amount
-                        'cur': txn['cur']  # Preserve original currency
-                    })
-                    continue
+                # Get provider chain
+                flow = select_providers_for_transaction(transaction, provider_states)
                 
-                # Score providers
-                provider_daily_amounts = np.array([daily_amounts[pid] for pid in valid_providers['ID']])
+                # Determine if the transaction was successful
+                success = len(flow) > 0
+                selected_provider = None
                 
-                if use_gpu and len(valid_providers) > 10:
-                    scores = score_provider_vectorized_gpu(
-                        valid_providers,
-                        np.array([txn['amount_usd']]),
-                        provider_daily_amounts
+                if success:
+                    last_provider_id = int(flow[-1])
+                    selected_provider = next(
+                        (p for p in provider_states if p.id == last_provider_id),
+                        None
                     )
+                    if selected_provider:
+                        daily_amounts[selected_provider.id] += txn['amount']
                 else:
-                    scores = score_provider_vectorized(
-                        valid_providers,
-                        np.array([txn['amount_usd']]),
-                        provider_daily_amounts
-                    )
+                    total_failed += 1
+                    if not any(p.min_sum <= txn['amount'] <= p.max_sum for p in provider_states):
+                        amount_mismatches += 1
                 
-                valid_providers['score'] = scores
-                scored_providers = valid_providers.sort_values('score', ascending=False)
-                
-                selected = None
-                flow = []
-                attempt_count = 0
-                
-                # Try providers in order of score until success or max attempts reached
-                for _, provider in scored_providers.iterrows():
-                    if attempt_count >= max_fallback_attempts:
-                        break
-                        
-                    provider = provider.copy()  # Avoid modifying original
-                    provider['chain_index'] = attempt_count
-                    flow.append(str(provider['ID']))
-                    
-                    # Calculate success probability
-                    dynamic_conv = get_recent_conversion_estimate(provider['ID'])
-                    base_conv = provider['CONVERSION']
-                    effective_conv = 0.5 * base_conv + 0.5 * dynamic_conv
-                    
-                    # Check if we can use this provider (within limits)
-                    can_use = (daily_amounts[provider['ID']] + txn['amount_usd'] <= provider['LIMIT_MAX'])
-                    success_prob = effective_conv if can_use else 0.0
-                    
-                    # Simulate success/failure
-                    if random() <= success_prob:
-                        selected = provider
-                        daily_amounts[provider['ID']] += txn['amount_usd']
-                        update_recent_success(provider['ID'], True)
-                        break
-                    else:
-                        update_recent_success(provider['ID'], False)
-                    
-                    attempt_count += 1
-                
-                # Record result
                 results.append({
                     'payment': txn['payment'],
-                    'flow': '-'.join(flow) if flow else 'failed',
-                    'status': 'CAPTURED' if selected is not None else 'FAILED',
-                    'provider': selected['ID'] if selected is not None else None,
+                    'flow': '-'.join(flow) if flow else '',
+                    'status': 'CAPTURED' if success else 'FAILED',
+                    'provider': selected_provider.id if selected_provider else None,
                     'eventTimeRes': txn['eventTimeRes'],
                     'amount_usd': txn['amount_usd'],
-                    'amount': txn['amount'],  # Preserve original amount
-                    'cur': txn['cur']  # Preserve original currency
+                    'amount': txn['amount'],
+                    'cur': txn['cur']
                 })
                 
             except Exception as e:
                 print(f"Error processing transaction: {str(e)}")
                 results.append({
                     'payment': txn['payment'],
-                    'flow': 'failed',
+                    'flow': '',
                     'status': 'FAILED',
                     'provider': None,
                     'eventTimeRes': txn['eventTimeRes'],
                     'amount_usd': txn.get('amount_usd', 0),
-                    'amount': txn.get('amount', 0),  # Preserve original amount
-                    'cur': txn.get('cur', '')  # Preserve original currency
+                    'amount': txn.get('amount', 0),
+                    'cur': txn.get('cur', '')
                 })
                 continue
+        
+        # Log summary statistics for the chunk
+        if total_processed > 0:
+            success_rate = (total_processed - total_failed) / total_processed * 100
+            print(f"\nChunk Summary:")
+            print(f"Processed: {total_processed}, Success Rate: {success_rate:.1f}%")
+            print(f"Amount Range Mismatches: {amount_mismatches}")
         
         return pd.DataFrame(results)
         
     except Exception as e:
         print(f"Error processing chunk: {str(e)}")
-        return create_empty_results()
+        return pd.DataFrame()
 
 # --- Main Simulation ---
 
@@ -893,8 +866,7 @@ def get_recent_conversion_estimate(provider_id):
     """Compute short-horizon conversion estimate for a provider."""
     data = recent_success_tracker[provider_id]
     if len(data) == 0:
-        # fallback if no recent data
-        return 1.0
+        return 1.0  # fallback if no recent data
     return sum(data) / len(data)
 
 def format_final_output(results_df):
@@ -915,11 +887,10 @@ def reset_daily_states():
     global recent_success_tracker
     
     # Reset provider tracking
-    recent_success_tracker = defaultdict(lambda: deque(maxlen=500))
+    recent_success_tracker.clear()
     
-    # Reset ML model states if needed
-    if hasattr(EnhancedMLScorer, 'instance'):
-        EnhancedMLScorer.instance.reset_state()
+    # Reset any other global states here
+    # ...
 
 class MetricsTracker:
     def __init__(self):
@@ -954,3 +925,225 @@ class MetricsTracker:
             'total_profit': self.metrics['total_profit'],
             'total_penalties': self.metrics['total_penalties']
         }
+
+def dynamic_time_limit(txn_amount, base_time=60, max_time=300, pivot=5000):
+    """Scale the allowable time limit based on payment amount."""
+    # If the payment is small, keep it short
+    if txn_amount <= pivot:
+        return base_time
+    # For amounts above 'pivot', scale up to 'max_time'
+    ratio = (txn_amount - pivot) / float(pivot)
+    scaled_time = base_time + (max_time - base_time) * ratio
+    return min(scaled_time, max_time)
+
+def determine_chain_length(txn_amount_usd):
+    """
+    Decide max chain length based on how large the payment is.
+    Small payments get fewer attempts, large ones allow more fallback.
+    """
+    if txn_amount_usd < 1:
+        return 2   # e.g. micropayments
+    elif txn_amount_usd < 100:
+        return 3
+    elif txn_amount_usd < 1000:
+        return 4
+    else:
+        return 6   # bigger sums can try more providers
+
+def estimate_provider_success_with_ml(transaction, provider):
+    """
+    Placeholder for an actual ML-based approach.
+    You might use a logistic regression or a random forest
+    that takes multiple features and returns a predicted success probability.
+    """
+    # Hypothetical usage:
+    # features = [
+    #     transaction.amount,
+    #     transaction.usd_amount,
+    #     provider.conversion,
+    #     provider.avg_time,
+    #     provider.commission,
+    #     ...
+    # ]
+    # predicted_success_prob = model.predict_proba([features])[0][1]
+    # return predicted_success_prob
+    return provider.conversion  # fallback to simple heuristic
+
+def select_providers_for_transaction(transaction, providers_state):
+    # Filter valid providers with reduced logging
+    candidate_providers = []
+    currency_matches = []
+    
+    for p in providers_state:
+        if p.currency == transaction.cur:
+            currency_matches.append(p)
+            if p.min_sum <= transaction.amount <= p.max_sum:
+                candidate_providers.append(p)
+    
+    if not candidate_providers:
+        # Only log if debug logging is enabled
+        if len(currency_matches) == 0:
+            # Currency mismatch is unusual and worth logging
+            print(f"No providers match currency {transaction.cur}")
+        # Remove the amount logging since it's too verbose
+        return []
+
+    # Calculate the user's dynamic max_time based on transaction amount
+    txn_amount_usd = convert_currency_to_usd(transaction.amount, transaction.cur, ex_rates)
+    user_time_limit = dynamic_time_limit(txn_amount_usd)
+    
+    # Decide chain length
+    max_chain_length = determine_chain_length(txn_amount_usd)
+    
+    candidate_providers = []
+    for p in providers_state:
+        if (p.currency == transaction.cur and
+            p.min_sum <= transaction.amount <= p.max_sum):
+            # daily limit check, or remove it if you prefer
+            if p.daily_volume + transaction.amount <= p.limit_max:
+                candidate_providers.append(p)
+    
+    if not candidate_providers:
+        return []
+    
+    # Example: incorporate optional ML-based success estimate
+    for p in candidate_providers:
+        dynamic_conv = get_recent_conversion_estimate(p.id)
+        # Switch to a real ML approach or combine with dynamic_conv
+        ml_conv = estimate_provider_success_with_ml(transaction, p)
+        
+        # Weighted combination
+        effective_conv = 0.5 * dynamic_conv + 0.5 * ml_conv
+        
+        # Weighted scoring: bigger emphasis on success probability
+        p.expected_score = (
+            effective_conv * 3.0 +
+            (1 - p.commission) * 0.3 +
+            (1 / (p.avg_time + 1)) * 0.2
+        )
+    
+    candidate_providers.sort(key=lambda px: px.expected_score, reverse=True)
+    
+    flow = []
+    total_time = 0
+    attempts = 0
+    
+    # Attempt providers, capping attempts by time and chain length
+    for provider in candidate_providers:
+        attempts += 1
+        if attempts > max_chain_length:
+            # Exceeded recommended fallback attempts
+            break
+        
+        # Check time limit
+        if total_time + provider.avg_time > user_time_limit and attempts > 1:
+            # only break if we've done at least one attempt
+            break
+        
+        flow.append(str(provider.id))
+        
+        success = simulate_provider_result(transaction, provider)
+        if success:
+            return flow
+        
+        total_time += provider.avg_time
+    
+    return flow
+
+def simulate_provider_result(transaction, provider):
+    """Less restrictive success simulation"""
+    # Get conversion estimate
+    dynamic_conv = get_recent_conversion_estimate(provider.id)
+    base_conv = provider.conversion
+    
+    # Weighted
+    effective_conv = 0.8 * base_conv + 0.2 * dynamic_conv
+    
+    prob = effective_conv
+    
+    # Additional logic for near-min or near-max
+    if transaction.amount < provider.min_sum * 1.2:
+        prob *= 0.95
+    if transaction.amount > provider.max_sum * 0.8:
+        prob *= 0.95
+    
+    # If daily limit is nearly maxed
+    if (provider.daily_volume + transaction.amount) > provider.limit_max:
+        prob *= 0.8
+    
+    # (Optional) clamp probability to [0.05, 0.99] for realism
+    prob = min(max(prob, 0.05), 0.99)
+    
+    # Random outcome - Fix: Use random.random() instead of random()
+    success = (random.random() < prob)  # Changed from random() to random.random()
+    
+    # If success, update daily volume
+    if success:
+        provider.daily_volume += transaction.amount
+    
+    return success
+
+class ProviderState:
+    def __init__(self, provider_data):
+        self.id = provider_data['ID']
+        self.currency = provider_data['CURRENCY']
+        self.conversion = provider_data['CONVERSION']
+        self.avg_time = provider_data['AVG_TIME']
+        self.commission = provider_data['COMMISSION']
+        self.min_sum = provider_data['MIN_SUM']
+        self.max_sum = provider_data['MAX_SUM']
+        self.limit_min = provider_data['LIMIT_MIN']
+        self.limit_max = provider_data['LIMIT_MAX']
+        self.daily_volume = 0.0
+        self.success_count = 0
+        self.total_count = 0
+        
+    def update_stats(self, amount, success):
+        """Update provider statistics after each attempt"""
+        self.total_count += 1
+        if success:
+            self.success_count += 1
+            self.daily_volume += amount
+            
+    def get_current_conversion(self):
+        """Get actual conversion rate based on today's transactions"""
+        if self.total_count == 0:
+            return self.conversion
+        return self.success_count / self.total_count
+
+class ConversionTracker:
+    def __init__(self):
+        self.total_attempts = 0
+        self.currency_mismatches = 0
+        self.amount_mismatches = 0
+        self.limit_exceeded = 0
+        self.time_exceeded = 0
+        self.successful = 0
+        self.chain_lengths = []
+        
+    def log_attempt(self, result, chain_length=0, reason=None):
+        self.total_attempts += 1
+        if result == 'success':
+            self.successful += 1
+        elif reason:
+            if reason == 'currency':
+                self.currency_mismatches += 1
+            elif reason == 'amount':
+                self.amount_mismatches += 1
+            elif reason == 'limit':
+                self.limit_exceeded += 1
+            elif reason == 'time':
+                self.time_exceeded += 1
+        
+        if chain_length:
+            self.chain_lengths.append(chain_length)
+            
+    def print_stats(self):
+        print("\nConversion Analysis:")
+        print(f"Total Attempts: {self.total_attempts}")
+        print(f"Successful: {self.successful} ({self.successful/self.total_attempts*100:.2f}%)")
+        print(f"Currency Mismatches: {self.currency_mismatches}")
+        print(f"Amount Mismatches: {self.amount_mismatches}")
+        print(f"Limit Exceeded: {self.limit_exceeded}")
+        print(f"Time Exceeded: {self.time_exceeded}")
+        print(f"Avg Chain Length: {np.mean(self.chain_lengths):.2f}")
