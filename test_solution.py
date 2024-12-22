@@ -273,15 +273,37 @@ def parse_args():
     return parser.parse_args()
 
 def save_results(results, filepath):
-    """Save processed results to a file"""
+    """Save processed results to a file with improved error handling"""
     try:
+        # Convert filepath to Path object if it isn't already
+        filepath = Path(filepath)
+        
         if filepath.suffix == '.csv':
             results.to_csv(filepath, index=False)
+        elif filepath.suffix == '.parquet':
+            try:
+                results.to_parquet(filepath, engine='pyarrow', compression='gzip')
+            except ImportError:
+                # Fallback to CSV if parquet fails
+                csv_path = filepath.with_suffix('.csv')
+                print(f"Warning: Parquet save failed, saving as CSV to {csv_path}")
+                results.to_csv(csv_path, index=False)
         else:
-            results.to_parquet(filepath, compression='gzip')
+            print(f"Warning: Unrecognized file extension {filepath.suffix}, defaulting to CSV")
+            csv_path = filepath.with_suffix('.csv')
+            results.to_csv(csv_path, index=False)
+            
         print(f"Results saved to {filepath}")
+        
     except Exception as e:
         print(f"Error saving results: {str(e)}")
+        # Try to save to a backup location
+        try:
+            backup_path = Path('backup_results.csv')
+            results.to_csv(backup_path, index=False)
+            print(f"Results saved to backup location: {backup_path}")
+        except Exception as backup_e:
+            print(f"Failed to save backup: {str(backup_e)}")
 
 def format_final_output(results_df, for_output=False):
     """Format results to match required output format

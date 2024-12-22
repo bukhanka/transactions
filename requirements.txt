@@ -4,4 +4,8 @@ scikit-learn
 xgboost
 joblib
 matplotlib
-seaborn 
+seaborn
+tqdm
+numba
+pathlib
+pyarrow

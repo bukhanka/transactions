@@ -15,8 +15,6 @@ import warnings
 warnings.filterwarnings('ignore')
 from multiprocessing import Pool
 import os  # For CPU count
-import cupy as cp  # Add at top with other imports
-from numba import cuda  # For custom CUDA kernels if needed
 import time
 from tqdm import tqdm  # Add at top with other imports
 from functools import partial
@@ -128,28 +126,35 @@ def calculate_penalty_vectorized(amounts, min_limits):
     return penalties
 
 def score_provider_vectorized(providers_df, amounts_usd, daily_amounts):
-    """Vectorized scoring for multiple providers"""
-    w1, w2, w3, w4 = 1.0, 0.5, 1.0, 1.0
+    """CPU version of provider scoring"""
+    w1, w2, w3, w4, w5 = 1.0, 0.5, 1.0, 1.0, 0.2
     
-    # Ensure inputs are numpy arrays
-    amounts_usd = np.asarray(amounts_usd).reshape(-1, 1)
+    # Use numpy instead of cupy
+    amounts = np.asarray(amounts_usd).reshape(-1, 1)
     
     # Calculate components
-    profits = amounts_usd * (1 - providers_df['COMMISSION'].values)
+    profits = amounts * (1 - providers_df['COMMISSION'].values)
     time_scores = 1/providers_df['AVG_TIME'].values
-    conversion_scores = providers_df['CONVERSION'].values
     
-    # Calculate penalties using daily amounts
-    penalties = calculate_penalty_vectorized(
-        daily_amounts + amounts_usd.flatten(),
-        providers_df['LIMIT_MIN'].values
-    )
+    # Get conversion estimates
+    conversion_scores = np.zeros_like(providers_df['COMMISSION'].values)
+    for i, provider in enumerate(providers_df.itertuples()):
+        dynamic_conv = get_recent_conversion_estimate(provider.ID)
+        base_conv = provider.CONVERSION
+        conversion_scores[i] = 0.5 * base_conv + 0.5 * dynamic_conv
+    
+    # Calculate penalties
+    penalties = np.zeros_like(daily_amounts, dtype=np.float32)
+    mask = (daily_amounts + amounts.flatten()) < providers_df['LIMIT_MIN'].values
+    penalties[mask] = (providers_df['LIMIT_MIN'].values[mask] - 
+                      (daily_amounts[mask] + amounts.flatten()[mask])) * 0.01
     
     # Combine scores
     scores = (w1 * profits.flatten() + 
-             w2 * time_scores + 
-             w3 * conversion_scores - 
-             w4 * penalties)
+             w2 * conversion_scores + 
+             w3 * time_scores - 
+             w4 * penalties - 
+             w5 * providers_df.get('chain_index', np.zeros_like(profits)).flatten())
     
     return scores
 
@@ -251,7 +256,7 @@ def score_provider(provider, payment_amount_usd, previous_daily_amount_used, hyp
     return score
 
 # --- 4. Transaction Simulation ---
-def simulate_transactions_parallel(providers, transactions_file, num_processes=None, use_gpu=True):
+def simulate_transactions_parallel(providers, transactions_file, num_processes=None, use_gpu=False):
     """Process transactions in parallel chunks"""
     try:
         if num_processes is None:
@@ -738,44 +743,6 @@ class ProviderCache:
         if date_key not in self._cache:
             self._cache[date_key] = get_provider_data_at_time(providers, time)
         return self._cache[date_key]
-
-def score_provider_vectorized_gpu(providers_df, amounts_usd, daily_amounts):
-    """GPU-accelerated provider scoring with chain index support"""
-    w1, w2, w3, w4, w5 = 1.0, 0.5, 1.0, 1.0, 0.2
-    
-    # Move data to GPU
-    amounts_gpu = cp.asarray(amounts_usd).reshape(-1, 1)
-    commission_gpu = cp.asarray(providers_df['COMMISSION'].values)
-    time_gpu = cp.asarray(providers_df['AVG_TIME'].values)
-    daily_amounts_gpu = cp.asarray(daily_amounts)
-    limit_min_gpu = cp.asarray(providers_df['LIMIT_MIN'].values)
-    chain_index_gpu = cp.asarray(providers_df['chain_index'].values if 'chain_index' in providers_df else cp.zeros_like(commission_gpu))
-    
-    # Calculate components on GPU
-    profits = amounts_gpu * (1 - commission_gpu)
-    time_scores = 1/time_gpu
-    
-    # Get conversion estimates
-    conversion_scores = cp.zeros_like(commission_gpu)
-    for i, provider in enumerate(providers_df.itertuples()):
-        dynamic_conv = get_recent_conversion_estimate(provider.ID)
-        base_conv = provider.CONVERSION
-        conversion_scores[i] = 0.5 * base_conv + 0.5 * dynamic_conv
-    
-    # Calculate penalties
-    penalties = cp.zeros_like(daily_amounts_gpu, dtype=cp.float32)
-    mask = (daily_amounts_gpu + amounts_gpu.flatten()) < limit_min_gpu
-    penalties[mask] = (limit_min_gpu[mask] - (daily_amounts_gpu[mask] + amounts_gpu.flatten()[mask])) * 0.01
-    
-    # Combine scores with chain penalty
-    scores = (w1 * profits.flatten() + 
-             w2 * conversion_scores + 
-             w3 * time_scores - 
-             w4 * penalties - 
-             w5 * chain_index_gpu)
-    
-    # Move result back to CPU
-    return cp.asnumpy(scores)
 
 def create_empty_results():
     """Create an empty DataFrame with the correct structure for results"""
